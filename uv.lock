@@ -19,6 +19,7 @@ dependencies = [
     { name = "langchain" },
     { name = "loguru" },
     { name = "polars" },
+    { name = "pydantic" },
     { name = "tqdm" },
 ]
 
@@ -27,6 +28,7 @@ requires-dist = [
     { name = "langchain", specifier = ">=0.3.24" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "polars", specifier = ">=1.27.1" },
+    { name = "pydantic", specifier = ">=2.11.3" },
     { name = "tqdm", specifier = ">=4.67.1" },
 ]
 
