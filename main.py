@@ -1,6 +1,6 @@
 import asyncio
 import os
-from typing import Any
+from typing import Any, Optional
 
 import polars as pl
 from langchain_core.messages import SystemMessage
@@ -21,6 +21,15 @@ class Annotate(BaseModel):
 
 
 def load_data(tsv_file: str, output_file: str) -> pl.DataFrame:
+    """加载数据并过滤
+
+    Args:
+        tsv_file: 原始输入（TSV）
+        output_file: 用于暂存中间结果的文件（CSV）
+
+    Returns:
+        过滤后的dataframe
+    """
     df = pl.read_csv(
         tsv_file,
         has_header=False,
@@ -71,6 +80,16 @@ def load_data(tsv_file: str, output_file: str) -> pl.DataFrame:
 
 
 async def annotate_gene_by_llm(gene_name: str, gene_df: pl.DataFrame) -> dict[str, Any]:
+    """使用大模型对单个基因功能进行注释
+
+    Args:
+        gene_name: 基因名称
+        gene_df: 截取的注释dataframe
+
+    Returns:
+        注释结果
+    """
+
     lines = ['| InterPro Accession | InterPro Description | Score |', '| ---- | ---- | ---- |']
     desc_list = []
     for row in gene_df.iter_rows():
@@ -94,10 +113,25 @@ async def annotate_gene_by_llm(gene_name: str, gene_df: pl.DataFrame) -> dict[st
     return result_dict
 
 
-async def run_analyse(gene_df: pl.DataFrame, output_file: str):
+async def run_analyse(
+    gene_df: pl.DataFrame, output_file: str, concurrency: int = 5, cut: Optional[int] = None
+):
+    """异步执行注释任务
+
+    Args:
+        gene_df: 过滤后的数据表
+        output_file: 结果保存文件（TSV）
+        concurrency: 最大并发数
+        cut: 截取
+    """
+
     genes = gene_df['ID'].unique()
+    if cut:
+        genes = genes[:cut]
+
     result = []
-    semaphore = asyncio.Semaphore(5)
+
+    semaphore = asyncio.Semaphore(concurrency)
 
     async def sem_task(_gene):
         async with semaphore:
