@@ -95,11 +95,18 @@ async def annotate_gene_by_llm(gene_name: str, gene_df: pl.DataFrame) -> dict[st
 
 
 async def run_analyse(gene_df: pl.DataFrame, output_file: str):
-    genes = gene_df['ID'].unique()[:3]
+    genes = gene_df['ID'].unique()
     result = []
-    for gene in tqdm(genes, total=len(genes)):
-        sub_df = gene_df.filter(pl.col('ID') == gene).drop(['ID'])
-        annotation = await annotate_gene_by_llm(gene, sub_df)
+    semaphore = asyncio.Semaphore(5)
+
+    async def sem_task(_gene):
+        async with semaphore:
+            sub_df = gene_df.filter(pl.col('ID') == _gene).drop(['ID'])
+            return await annotate_gene_by_llm(_gene, sub_df)
+
+    tasks = [sem_task(gene) for gene in genes]
+    for coro in tqdm(asyncio.as_completed(tasks), total=len(genes)):
+        annotation = await coro
         result.append(annotation)
 
     output_df = pl.DataFrame(result)
