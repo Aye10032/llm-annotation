@@ -65,12 +65,12 @@ def load_data(tsv_file: str, output_file: str) -> pl.DataFrame:
                 'InterPro annotations description',
             ]
         )
-        .filter(pl.col('InterPro annotations description').is_not_null())
-        .with_columns(pl.col('Score').fill_null(0))
+        .filter(pl.col('InterPro annotations description').is_not_null()) # 过滤InterPro accession为空的数据
+        .with_columns(pl.col('Score').fill_null(0)) # Score为空的条目填充（这里如果是最小的话，是不是就不能填0了？填个INF之类的？）float('inf')
         .unique()
-        .group_by(['ID', 'InterPro annotations accession', 'InterPro annotations description'])
-        .agg([pl.col('Score').max().alias('Score')])
-        .sort(['ID', 'Score', 'InterPro annotations accession'], descending=True)
+        .group_by(['ID', 'InterPro annotations accession', 'InterPro annotations description']) # 合并重复条目
+        .agg([pl.col('Score').min().alias('Score')])
+        .sort(['ID', 'Score', 'InterPro annotations accession'], descending=False) # 排序
     )
     not_null_df.write_csv(output_file)
     genes = not_null_df['ID'].unique()
@@ -90,11 +90,11 @@ async def annotate_gene_by_llm(gene_name: str, gene_df: pl.DataFrame) -> dict[st
         注释结果
     """
 
-    lines = ['| InterPro Accession | InterPro Description | Score |', '| ---- | ---- | ---- |']
+    lines = ['下面每一行代表该基因的一个注释结果']
     desc_list = []
     for row in gene_df.iter_rows():
         accession, description, score = row
-        lines.append(f'| {accession} | {description} | {score} |')
+        lines.append(description)
         desc_list.append(f'{accession},{description},{score}')
     info_text = '\n'.join(lines)
 
@@ -149,7 +149,7 @@ async def run_analyse(
 
 def main():
     origin_df = load_data('report/IMET1v2.tsv', 'report/filtered.csv')
-    asyncio.run(run_analyse(origin_df, 'report/result.tsv'))
+    asyncio.run(run_analyse(origin_df, 'report/result.tsv', cut=10))
 
 
 if __name__ == '__main__':
