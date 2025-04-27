@@ -1,5 +1,23 @@
+import asyncio
+import os
+from typing import Any
+
 import polars as pl
+from langchain_core.messages import SystemMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
 from loguru import logger
+from pydantic import BaseModel, Field
+from tqdm.asyncio import tqdm
+
+API_KEY = os.getenv('OPENAI_API_KEY')
+SYSTEM_PROMPT = """用户会给出基因的 InterPro 注释。请用20字以内的中文总结该基因的主要功能（若无可靠信息写“未知功能”）"""
+
+llm = ChatOpenAI(model='o4-mini', base_url='https://aihubmix.com/v1', api_key=API_KEY)
+
+
+class Annotate(BaseModel):
+    description: str = Field(description='基因的主要功能')
 
 
 def load_data(tsv_file: str, output_file: str) -> pl.DataFrame:
@@ -39,6 +57,7 @@ def load_data(tsv_file: str, output_file: str) -> pl.DataFrame:
             ]
         )
         .filter(pl.col('InterPro annotations description').is_not_null())
+        .with_columns(pl.col('Score').fill_null(0))
         .unique()
         .group_by(['ID', 'InterPro annotations accession', 'InterPro annotations description'])
         .agg([pl.col('Score').max().alias('Score')])
@@ -51,17 +70,45 @@ def load_data(tsv_file: str, output_file: str) -> pl.DataFrame:
     return not_null_df
 
 
-def annotate_gene_by_llm(gene_df: pl.DataFrame) -> str:
-    print(gene_df)
+async def annotate_gene_by_llm(gene_name: str, gene_df: pl.DataFrame) -> dict[str, Any]:
+    lines = ['| InterPro Accession | InterPro Description | Score |', '| ---- | ---- | ---- |']
+    desc_list = []
+    for row in gene_df.iter_rows():
+        accession, description, score = row
+        lines.append(f'| {accession} | {description} | {score} |')
+        desc_list.append(f'{accession},{description},{score}')
+    info_text = '\n'.join(lines)
+
+    prompt = ChatPromptTemplate.from_messages(
+        [SystemMessage(content=SYSTEM_PROMPT), ('human', '{input}')]
+    )
+    chain = prompt | llm.with_structured_output(Annotate)
+    result: Annotate = await chain.ainvoke({'input': info_text})
+
+    result_dict = {
+        'ID': gene_name,
+        'Description': result.description,
+        'All Description': ';'.join(desc_list),
+    }
+
+    return result_dict
+
+
+async def run_analyse(gene_df: pl.DataFrame, output_file: str):
+    genes = gene_df['ID'].unique()[:3]
+    result = []
+    for gene in tqdm(genes, total=len(genes)):
+        sub_df = gene_df.filter(pl.col('ID') == gene).drop(['ID'])
+        annotation = await annotate_gene_by_llm(gene, sub_df)
+        result.append(annotation)
+
+    output_df = pl.DataFrame(result)
+    output_df.write_csv(output_file, separator='\t')
 
 
 def main():
     origin_df = load_data('report/IMET1v2.tsv', 'report/filtered.csv')
-    genes = origin_df['ID'].unique()
-    for gene in genes:
-        sub_df = origin_df.filter(pl.col('ID') == gene)
-        annotate_gene_by_llm(sub_df)
-        break
+    asyncio.run(run_analyse(origin_df, 'report/result.tsv'))
 
 
 if __name__ == '__main__':
