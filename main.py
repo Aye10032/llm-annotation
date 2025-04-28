@@ -52,7 +52,7 @@ HUMAN_PROMPT = """下面每一行代表该基因的一个注释结果。
 {input}
 """
 
-llm = ChatOpenAI(model='o4-mini', base_url='https://aihubmix.com/v1', api_key=API_KEY)
+llm = ChatOpenAI(model='gpt-4.1-nano', base_url='https://aihubmix.com/v1', api_key=API_KEY)
 
 
 # 结构定义在这里，直接修改不同词条后面的description就可以
