@@ -178,14 +178,12 @@ async def annotate_gene_by_llm(gene_name: str, gene_df: pl.DataFrame) -> dict[st
         注释结果
     """
 
-    print(gene_name)
     lines = []
     desc_list = []
     for row in gene_df.iter_rows(named=True):
         lines.append(f'{row["Description"]} [{row["Preferred Name"]}] ({row["Source"]})')
         desc_list.append(f'{row["Accession"]}|{row["Description"]}|{row["Source"]}|{row["Score"]}')
     info_text = '\n'.join(lines)
-    print(info_text)
 
     prompt = ChatPromptTemplate.from_messages(
         [SystemMessage(content=SYSTEM_PROMPT), ('human', HUMAN_PROMPT)]
@@ -245,7 +243,7 @@ def main():
     origin_df = load_data(
         'report/IMET1v2.tsv', 'report/gene.emapper.annotations', 'report/filtered.csv'
     )
-    asyncio.run(run_analyse(origin_df, 'report/result.tsv', cut=10))
+    asyncio.run(run_analyse(origin_df, 'report/result.tsv', cut=5))
 
 
 if __name__ == '__main__':
