@@ -1,5 +1,6 @@
 import asyncio
 import os
+from pathlib import Path
 from typing import Any, Optional
 
 import polars as pl
@@ -27,11 +28,10 @@ if Preferred Name is not empty, give it a high priority as the gene name.
 
 # Output Format
 Output in two parts:
+- Gene/protein name
+- Short description of gene function
 
-Gene or protein name
-Short description of gene function
-
-## 具体逻辑如下：
+## description具体逻辑如下：
 | 优先级 | 注释内容                                                         | 理由               |
 | --- | ------------------------------------------------------------ | ---------------- |
 | 1   | **具体的功能蛋白名**（如"ATP synthase subunit beta"）                   | 直接可理解，方便后续基因功能分类 |
@@ -80,6 +80,12 @@ def load_data(inter_pro_file: str, eggnog_file: str, output_file: str) -> pl.Dat
         过滤后的dataframe
     """
 
+    temp_file = Path(output_file)
+    if temp_file.exists():
+        filter_df = pl.read_csv(output_file)
+        logger.info(f'读取已存在的过滤结果，共{filter_df.shape[0]}条')
+        return filter_df
+
     # InterProScan结果读取
     interpro_df = pl.read_csv(
         inter_pro_file,
@@ -125,7 +131,6 @@ def load_data(inter_pro_file: str, eggnog_file: str, output_file: str) -> pl.Dat
         )
         .filter(pl.col('Description').is_not_null())
         .unique()
-        # .with_columns(pl.col('Score').fill_null(float('inf')))
         .with_columns(pl.lit('InterProScan').alias('Source'))
         .with_columns(pl.lit(None).alias('Preferred Name'))
         .select(['ID', 'Accession', 'Description', 'Score', 'Source', 'Preferred Name'])
@@ -215,6 +220,7 @@ async def run_analyse(
     concurrency: int = 5,
     top: int = 5,
     cut: Optional[int] = None,
+    override: bool = False,
 ):
     """异步执行注释任务
 
@@ -224,11 +230,22 @@ async def run_analyse(
         concurrency: 最大并发数
         top: 每一条记录取前N条结果询问AI
         cut: 截取多少条记录（测试用）
+        override:  是否覆盖写入
     """
 
     genes = gene_df['ID'].unique()
     if cut:
         genes = genes[:cut]
+
+    if Path(output_file).exists():
+        origin_df = pl.read_csv(output_file, has_header=True, separator='\t')
+        exist_genes = origin_df['ID'].unique()
+        if override:
+            origin_df = origin_df.filter(~pl.col('ID').is_in(genes))
+        else:
+            genes = genes.filter(~genes.is_in(set(exist_genes)))
+    else:
+        origin_df = pl.DataFrame([])
 
     result = []
 
@@ -244,15 +261,63 @@ async def run_analyse(
         annotation = await coro
         result.append(annotation)
 
-    output_df = pl.DataFrame(result)
+    output_df = pl.concat([origin_df, pl.DataFrame(result)], how='vertical_relaxed')
     output_df.write_csv(output_file, separator='\t')
+
+
+async def get_single_gene(
+    fileter_df: pl.DataFrame,
+    gene_id: str,
+    output_file: str,
+    top: int = 5,
+    override: bool = False,
+) -> dict[str, Any]:
+    """尝试查询单个基因的注释
+
+    若现有结果中存在此基因，则直接返回；否则查询AI
+
+    Args:
+        fileter_df: 比对结果
+        gene_id: 待查询的ID
+        output_file: 现有注释结果
+        top:
+        override: 是否强制重新查询AI
+
+    Returns:
+        注释结果字典
+    """
+
+    if Path(output_file).exists():
+        result_df = pl.read_csv(output_file, separator='\t', has_header=True)
+
+        if gene_id in result_df['ID'].unique():
+            if override:
+                # 删除该条目
+                result_df = result_df.filter(~pl.col('ID').is_in([gene_id]))
+            else:
+                logger.info('发现了现有记录，已返回')
+                return result_df.filter(pl.col('ID') == gene_id).row(0, named=True)
+    else:
+        result_df = pl.DataFrame([])
+
+    logger.info('现有记录中没有此基因，开始查询AI')
+    sub_df = fileter_df.filter(pl.col('ID') == gene_id).top_k(top, by=['Score'])
+    result = await annotate_gene_by_llm(gene_id, sub_df)
+
+    # 更新记录
+    output_df = pl.concat([result_df, pl.DataFrame([result])], how='vertical_relaxed')
+    output_df.write_csv(output_file, separator='\t')
+
+    return result
 
 
 def main():
     origin_df = load_data(
         'report/IMET1v2.tsv', 'report/gene.emapper.annotations', 'report/filtered.csv'
     )
+
     asyncio.run(run_analyse(origin_df, 'report/result.tsv', cut=5))
+    # print(asyncio.run(get_single_gene(origin_df, 'NO01G00450', 'report/result.tsv')))
 
 
 if __name__ == '__main__':
