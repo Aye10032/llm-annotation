@@ -13,11 +13,25 @@ from tqdm.asyncio import tqdm
 API_KEY = os.getenv('OPENAI_API_KEY')
 SYSTEM_PROMPT = """
 # Task
-The user will provide InterProScan results for a gene. 
-Summarize the gene's main function in English, using no more than 20 words based on InterPro or similar annotation. 
-If no reliable information is available, write "unknown". Follow established nomenclature practices; provide the gene or protein name first if it can be determined, followed by the concise function.
+The user will provide merged InterProScan and EggNOG-mapper results for a gene of a microalgae species.
+Summarize the gene’s main function in English, adhering to established nomenclature practices.
+If no reliable information is available, write "unknown."
+if Preferred Name is not empty, give it a high priority as the gene name.
 
-具体逻辑如下：
+# Input Format
+用户给出的注释信息包括三个部分，结构如下：
+```
+"Function description" [Preferred Name] (Source)
+```
+其中Preferred Name可能为空。
+
+# Output Format
+Output in two parts:
+
+Gene or protein name
+Short description of gene function
+
+## 具体逻辑如下：
 | 优先级 | 注释内容                                                         | 理由               |
 | --- | ------------------------------------------------------------ | ---------------- |
 | 1   | **具体的功能蛋白名**（如"ATP synthase subunit beta"）                   | 直接可理解，方便后续基因功能分类 |
@@ -27,20 +41,13 @@ If no reliable information is available, write "unknown". Follow established nom
 | 5   | **未知/预测/重复/无意义注释**                                           | 排除               |
 总结成一句话就是：**优先选蛋白功能而不是结构描述，能标具体的就不留宽泛的。**
 
-# Input Format
-用户给出的注释信息包括三个部分，结构如下：
-```
-"Function description" [Preferred Name] (Source)
-```
-其中Preferred Name可能为空。
-
 ## Example
 input:
 ```
-Myb DNA-binding like [None] (eggNOG-mapper)
+Myb DNA-binding like [] (eggNOG-mapper)
 post-chaperonin tubulin folding pathway [TBCA] (eggNOG-mapper)
-Tubulin binding cofactor A superfamily [None] (InterProScan)
-Tubulin binding cofactor A [None] (InterProScan)
+Tubulin binding cofactor A superfamily [] (InterProScan)
+Tubulin binding cofactor A [] (InterProScan)
 ```
 
 output:
@@ -181,7 +188,8 @@ async def annotate_gene_by_llm(gene_name: str, gene_df: pl.DataFrame) -> dict[st
     lines = []
     desc_list = []
     for row in gene_df.iter_rows(named=True):
-        lines.append(f'{row["Description"]} [{row["Preferred Name"]}] ({row["Source"]})')
+        prefer_name = row['Preferred Name'] if row['Preferred Name'] else ''
+        lines.append(f'{row["Description"]} [{prefer_name}] ({row["Source"]})')
         desc_list.append(f'{row["Accession"]}|{row["Description"]}|{row["Source"]}|{row["Score"]}')
     info_text = '\n'.join(lines)
 
@@ -193,8 +201,9 @@ async def annotate_gene_by_llm(gene_name: str, gene_df: pl.DataFrame) -> dict[st
 
     result_dict = {
         'ID': gene_name,
-        'Description': f'[{result.name}] - [{result.description}]',
-        'All Description': ';'.join(desc_list),
+        'Gene Name': result.name,
+        'Des': result.description,
+        'All Des': ';'.join(desc_list),
     }
 
     return result_dict
