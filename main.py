@@ -11,27 +11,49 @@ from pydantic import BaseModel, Field
 from tqdm.asyncio import tqdm
 
 API_KEY = os.getenv('OPENAI_API_KEY')
-SYSTEM_PROMPT = """用户会给出基因的 InterPro 注释。请用20字以内的中文总结该基因的主要功能（若无可靠信息写“未知功能”）"""
+SYSTEM_PROMPT = """
+The user will provide InterProScan results for a gene. 
+Summarize the gene's main function in English, using no more than 20 words based on InterPro or similar annotation. 
+If no reliable information is available, write "unknown". Follow established nomenclature practices; provide the gene or protein name first if it can be determined, followed by the concise function.
+
+具体逻辑如下：
+| 优先级 | 注释内容                                                         | 理由               |
+| --- | ------------------------------------------------------------ | ---------------- |
+| 1   | **具体的功能蛋白名**（如"ATP synthase subunit beta"）                   | 直接可理解，方便后续基因功能分类 |
+| 2   | **通路成员**（如"Photosystem II oxygen-evolving enhancer protein"） | 可推断生物过程          |
+| 3   | **家族成员**（如"ABC transporter family member"）                   | 有参考意义，但较宽泛       |
+| 4   | **domain-only**（如"TPR domain"）                               | 不够具体，仅限于结构推测     |
+| 5   | **未知/预测/重复/无意义注释**                                           | 排除               |
+总结成一句话就是：**优先选蛋白功能而不是结构描述，能标具体的就不留宽泛的。**
+"""
+
+HUMAN_PROMPT = """下面每一行代表该基因的一个注释结果，结尾括号内是该注释来源的数据库。
+{input}
+"""
 
 llm = ChatOpenAI(model='o4-mini', base_url='https://aihubmix.com/v1', api_key=API_KEY)
 
 
 class Annotate(BaseModel):
-    description: str = Field(description='基因的主要功能')
+    name: str = Field(description='Gene/protein name')
+    description: str = Field(description="gene's main function in English ≤20 words")
 
 
-def load_data(tsv_file: str, output_file: str) -> pl.DataFrame:
+def load_data(inter_pro_file: str, eggnog_file: str, output_file: str) -> pl.DataFrame:
     """加载数据并过滤
 
     Args:
-        tsv_file: 原始输入（TSV）
+        inter_pro_file: InterProScan原始输入（TSV）
+        eggnog_file: eggNOG原始输入（TSV）
         output_file: 用于暂存中间结果的文件（CSV）
 
     Returns:
         过滤后的dataframe
     """
-    df = pl.read_csv(
-        tsv_file,
+
+    # InterProScan结果读取
+    interpro_df = pl.read_csv(
+        inter_pro_file,
         has_header=False,
         quote_char=None,
         separator='\t',
@@ -54,10 +76,10 @@ def load_data(tsv_file: str, output_file: str) -> pl.DataFrame:
             'Pathways annotations',
         ],
     )
-    logger.info(f'数据读取完毕，共{df.shape[0]}条')
+    logger.info(f'InterProScan数据读取完毕，共{interpro_df.shape[0]}条')
 
-    not_null_df = (
-        df.select(
+    filter_interpro_df = (
+        interpro_df.select(
             [
                 'ID',
                 'Score',
@@ -65,18 +87,62 @@ def load_data(tsv_file: str, output_file: str) -> pl.DataFrame:
                 'InterPro annotations description',
             ]
         )
-        .filter(pl.col('InterPro annotations description').is_not_null()) # 过滤InterPro accession为空的数据
-        .with_columns(pl.col('Score').fill_null(0)) # Score为空的条目填充（这里如果是最小的话，是不是就不能填0了？填个INF之类的？）float('inf')
+        .with_columns(pl.col('ID').str.slice(0, pl.col('ID').str.len_chars() - 2))
+        .rename(
+            {
+                'InterPro annotations accession': 'Accession',
+                'InterPro annotations description': 'Description',
+            }
+        )
+        .filter(pl.col('Description').is_not_null())
         .unique()
-        .group_by(['ID', 'InterPro annotations accession', 'InterPro annotations description']) # 合并重复条目
-        .agg([pl.col('Score').min().alias('Score')])
-        .sort(['ID', 'Score', 'InterPro annotations accession'], descending=False) # 排序
+        # .with_columns(pl.col('Score').fill_null(float('inf')))
+        .with_columns(pl.lit('InterProScan').alias('Source'))
+        .with_columns(pl.lit(None).alias('Preferred Name'))
+        .select(['ID', 'Accession', 'Description', 'Score', 'Source', 'Preferred Name'])
     )
-    not_null_df.write_csv(output_file)
-    genes = not_null_df['ID'].unique()
-    logger.info(f'过滤后注释非空记录共{not_null_df.shape[0]}条，{len(genes)}个基因')
+    genes = filter_interpro_df['ID'].unique()
+    logger.info(f'InterProScan过滤后记录共{filter_interpro_df.shape[0]}条，{len(genes)}个基因')
+    del interpro_df
 
-    return not_null_df
+    # eggNOG-mapper 结果读取
+    eggnog_df = pl.read_csv(
+        eggnog_file, separator='\t', comment_prefix='##', has_header=True, null_values='-'
+    )
+    logger.info(f'eggNOG-mapper数据读取完毕，共{eggnog_df.shape[0]}条')
+
+    filter_eggnog_df = (
+        eggnog_df.select(['#query', 'evalue', 'Description', 'Preferred_name', 'KEGG_ko'])
+        .with_columns(
+            pl.col('#query').str.slice(0, pl.col('#query').str.len_chars() - 2).alias('ID')
+        )
+        .rename(
+            {
+                'evalue': 'Score',
+                'Preferred_name': 'Preferred Name',
+                'KEGG_ko': 'Accession',
+            }
+        )
+        .filter(pl.col('Description').is_not_null())
+        .unique()
+        .with_columns(pl.lit('eggNOG-mapper').alias('Source'))
+        .select(['ID', 'Accession', 'Description', 'Score', 'Source', 'Preferred Name'])
+    )
+    genes = filter_eggnog_df['ID'].unique()
+    logger.info(f'eggNOG-mapper过滤后记录共{filter_eggnog_df.shape[0]}条，{len(genes)}个基因')
+
+    # 合并
+    filter_df = (
+        pl.concat([filter_interpro_df, filter_eggnog_df], how='vertical_relaxed')
+        .group_by(['ID', 'Accession', 'Description', 'Source', 'Preferred Name'])
+        .agg([pl.col('Score').min().alias('Score')])
+        .sort(['ID', 'Score', 'Accession'], descending=False)
+    )
+    genes = filter_df['ID'].unique()
+    logger.info(f'合并后记录共{filter_df.shape[0]}条，{len(genes)}个基因')
+    filter_df.write_csv(output_file)
+
+    return filter_df
 
 
 async def annotate_gene_by_llm(gene_name: str, gene_df: pl.DataFrame) -> dict[str, Any]:
@@ -90,23 +156,22 @@ async def annotate_gene_by_llm(gene_name: str, gene_df: pl.DataFrame) -> dict[st
         注释结果
     """
 
-    lines = ['下面每一行代表该基因的一个注释结果']
+    lines = []
     desc_list = []
-    for row in gene_df.iter_rows():
-        accession, description, score = row
-        lines.append(description)
-        desc_list.append(f'{accession},{description},{score}')
+    for row in gene_df.iter_rows(named=True):
+        lines.append(f'{row["Description"]} ({row["Source"]})')
+        desc_list.append(f'{row["Accession"]}|{row["Description"]}|{row["Source"]}|{row["Score"]}')
     info_text = '\n'.join(lines)
 
     prompt = ChatPromptTemplate.from_messages(
-        [SystemMessage(content=SYSTEM_PROMPT), ('human', '{input}')]
+        [SystemMessage(content=SYSTEM_PROMPT), ('human', HUMAN_PROMPT)]
     )
     chain = prompt | llm.with_structured_output(Annotate)
     result: Annotate = await chain.ainvoke({'input': info_text})
 
     result_dict = {
         'ID': gene_name,
-        'Description': result.description,
+        'Description': f'[{result.name}] - [{result.description}]',
         'All Description': ';'.join(desc_list),
     }
 
@@ -114,7 +179,11 @@ async def annotate_gene_by_llm(gene_name: str, gene_df: pl.DataFrame) -> dict[st
 
 
 async def run_analyse(
-    gene_df: pl.DataFrame, output_file: str, concurrency: int = 5, cut: Optional[int] = None
+    gene_df: pl.DataFrame,
+    output_file: str,
+    concurrency: int = 5,
+    top: int = 5,
+    cut: Optional[int] = None,
 ):
     """异步执行注释任务
 
@@ -122,7 +191,8 @@ async def run_analyse(
         gene_df: 过滤后的数据表
         output_file: 结果保存文件（TSV）
         concurrency: 最大并发数
-        cut: 截取
+        top: 每一条记录取前N条结果询问AI
+        cut: 截取多少条记录（测试用）
     """
 
     genes = gene_df['ID'].unique()
@@ -135,7 +205,7 @@ async def run_analyse(
 
     async def sem_task(_gene):
         async with semaphore:
-            sub_df = gene_df.filter(pl.col('ID') == _gene).drop(['ID'])
+            sub_df = gene_df.filter(pl.col('ID') == _gene).top_k(top, by=['Score'])
             return await annotate_gene_by_llm(_gene, sub_df)
 
     tasks = [sem_task(gene) for gene in genes]
@@ -148,7 +218,9 @@ async def run_analyse(
 
 
 def main():
-    origin_df = load_data('report/IMET1v2.tsv', 'report/filtered.csv')
+    origin_df = load_data(
+        'report/IMET1v2.tsv', 'report/gene.emapper.annotations', 'report/filtered.csv'
+    )
     asyncio.run(run_analyse(origin_df, 'report/result.tsv', cut=10))
 
 
