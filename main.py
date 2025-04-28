@@ -12,6 +12,7 @@ from tqdm.asyncio import tqdm
 
 API_KEY = os.getenv('OPENAI_API_KEY')
 SYSTEM_PROMPT = """
+# Task
 The user will provide InterProScan results for a gene. 
 Summarize the gene's main function in English, using no more than 20 words based on InterPro or similar annotation. 
 If no reliable information is available, write "unknown". Follow established nomenclature practices; provide the gene or protein name first if it can be determined, followed by the concise function.
@@ -25,9 +26,29 @@ If no reliable information is available, write "unknown". Follow established nom
 | 4   | **domain-only**（如"TPR domain"）                               | 不够具体，仅限于结构推测     |
 | 5   | **未知/预测/重复/无意义注释**                                           | 排除               |
 总结成一句话就是：**优先选蛋白功能而不是结构描述，能标具体的就不留宽泛的。**
+
+# Input Format
+用户给出的注释信息包括三个部分，结构如下：
+```
+"Function description" [Preferred Name] (Source)
+```
+其中Preferred Name可能为空。
+
+## Example
+input:
+```
+Myb DNA-binding like [None] (eggNOG-mapper)
+post-chaperonin tubulin folding pathway [TBCA] (eggNOG-mapper)
+Tubulin binding cofactor A superfamily [None] (InterProScan)
+Tubulin binding cofactor A [None] (InterProScan)
+```
+
+output:
+- name: TBCA
+- description: Assists post-chaperonin tubulin folding
 """
 
-HUMAN_PROMPT = """下面每一行代表该基因的一个注释结果，结尾括号内是该注释来源的数据库。
+HUMAN_PROMPT = """下面每一行代表该基因的一个注释结果。
 {input}
 """
 
@@ -157,12 +178,14 @@ async def annotate_gene_by_llm(gene_name: str, gene_df: pl.DataFrame) -> dict[st
         注释结果
     """
 
+    print(gene_name)
     lines = []
     desc_list = []
     for row in gene_df.iter_rows(named=True):
-        lines.append(f'{row["Description"]} ({row["Source"]})')
+        lines.append(f'{row["Description"]} [{row["Preferred Name"]}] ({row["Source"]})')
         desc_list.append(f'{row["Accession"]}|{row["Description"]}|{row["Source"]}|{row["Score"]}')
     info_text = '\n'.join(lines)
+    print(info_text)
 
     prompt = ChatPromptTemplate.from_messages(
         [SystemMessage(content=SYSTEM_PROMPT), ('human', HUMAN_PROMPT)]
